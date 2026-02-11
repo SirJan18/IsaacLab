@@ -435,6 +435,15 @@ class CrazyfliePointNavEnv(DirectRLEnv):
             L2FConstants.ROTOR_YAW_DIRS, device=self.device, dtype=torch.float32
         )
         
+        # Pre-compute mixer matrix (4 motors -> [roll, pitch, yaw] torques)
+        rp = self._rotor_positions
+        yd = self._rotor_yaw_dirs
+        self._torque_mixer = torch.stack([
+            rp[:, 1],                    # roll  = sum(F_i * y_i)
+            -rp[:, 0],                   # pitch = -sum(F_i * x_i)
+            self._torque_coef * yd,      # yaw   = k_torque * sum(dir_i * F_i)
+        ], dim=-1)  # shape: (4, 3)
+        
         # State tensors
         self._actions = torch.zeros(self.num_envs, 4, device=self.device)
         self._rpm_state = torch.zeros(self.num_envs, 4, device=self.device)
@@ -521,6 +530,10 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Get body ID for force application
         self._body_id = self._robot.find_bodies("body")[0]
+        
+        # Cache spawn position (env_origins + target height) to avoid recomputing every step
+        self._spawn_pos = self._terrain.env_origins.clone()
+        self._spawn_pos[:, 2] += self.cfg.init_target_height
         
         # Debug visualization
         self.set_debug_vis(self.cfg.debug_vis)
@@ -730,47 +743,19 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         thrust_per_motor = self._thrust_coef * self._rpm_state ** 2
         
         # Total thrust (body z-axis)
-        total_thrust = thrust_per_motor.sum(dim=-1)
+        self._thrust_body[:, 0, :2] = 0.0
+        self._thrust_body[:, 0, 2] = thrust_per_motor.sum(dim=-1)
         
-        thrust_body = torch.zeros(self.num_envs, 3, device=self.device)
-        thrust_body[:, 2] = total_thrust
-        
-        # Roll torque = sum(F_i * y_i)
-        roll_torque = (
-            thrust_per_motor[:, 0] * self._rotor_positions[0, 1] +
-            thrust_per_motor[:, 1] * self._rotor_positions[1, 1] +
-            thrust_per_motor[:, 2] * self._rotor_positions[2, 1] +
-            thrust_per_motor[:, 3] * self._rotor_positions[3, 1]
-        )
-        
-        # Pitch torque = -sum(F_i * x_i)
-        pitch_torque = -(
-            thrust_per_motor[:, 0] * self._rotor_positions[0, 0] +
-            thrust_per_motor[:, 1] * self._rotor_positions[1, 0] +
-            thrust_per_motor[:, 2] * self._rotor_positions[2, 0] +
-            thrust_per_motor[:, 3] * self._rotor_positions[3, 0]
-        )
-        
-        # Yaw torque = reaction torque
-        yaw_torque = self._torque_coef * (
-            self._rotor_yaw_dirs[0] * thrust_per_motor[:, 0] +
-            self._rotor_yaw_dirs[1] * thrust_per_motor[:, 1] +
-            self._rotor_yaw_dirs[2] * thrust_per_motor[:, 2] +
-            self._rotor_yaw_dirs[3] * thrust_per_motor[:, 3]
-        )
-        
-        torque_body = torch.stack([roll_torque, pitch_torque, yaw_torque], dim=-1)
+        # Compute torques via pre-computed mixer matrix: (N, 4) @ (4, 3) -> (N, 3)
+        self._torque_body[:, 0, :] = thrust_per_motor @ self._torque_mixer
         
         # Add disturbances
         if self.cfg.enable_disturbance:
-            thrust_body = thrust_body + self._disturbance_force
-            torque_body = torque_body + self._disturbance_torque
+            self._thrust_body[:, 0, :] += self._disturbance_force
+            self._torque_body[:, 0, :] += self._disturbance_torque
         
-        self._thrust_body[:, 0, :] = thrust_body
-        self._torque_body[:, 0, :] = torque_body
-        
-        # Update action history
-        self._action_history[:, :-1] = self._action_history[:, 1:].clone()
+        # Update action history (roll without clone)
+        self._action_history = torch.roll(self._action_history, -1, dims=1)
         self._action_history[:, -1] = self._actions
     
     def _apply_action(self):
@@ -802,9 +787,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         ang_vel_b = self._robot.data.root_ang_vel_b
         
         # Position relative to spawn origin (for compatibility with hover obs)
-        spawn_pos = self._terrain.env_origins.clone()
-        spawn_pos[:, 2] += cfg.init_target_height
-        pos_error = pos_w - spawn_pos
+        pos_error = pos_w - self._spawn_pos
         pos_error_clipped = pos_error.clamp(-cfg.obs_position_clip, cfg.obs_position_clip)
         
         # Velocity (clipped)
@@ -855,8 +838,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # =====================================================================
         
         # Height cost: deviation from target height
-        target_height = self._terrain.env_origins[:, 2] + cfg.init_target_height
-        height_error = pos_w[:, 2] - target_height
+        height_error = pos_w[:, 2] - self._spawn_pos[:, 2]
         height_cost = height_error ** 2
         
         # Orientation cost: 1 - qw² (deviation from upright)
@@ -930,8 +912,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Height tracking reward: Gaussian centered at target height
         # Rewards staying near target, decays smoothly with distance
-        target_height = self._terrain.env_origins[:, 2] + cfg.init_target_height
-        height_error = pos_w[:, 2] - target_height
+        height_error = pos_w[:, 2] - self._spawn_pos[:, 2]
         height_tracking_reward = cfg.nav_height_track_weight * torch.exp(-5.0 * height_error ** 2)
         
         # Height recovery reward: DELTA-based (reward for climbing, not for being low)
@@ -1562,9 +1543,10 @@ class L2FPPOAgent:
             return self.actor.get_action(obs_norm, deterministic)
     
     def get_action_and_value(self, obs: torch.Tensor):
-        obs_norm = self.normalize_obs(obs, update=True)
-        action, log_prob = self.actor.get_action_and_log_prob(obs_norm)
-        value = self.critic(obs_norm)
+        with torch.no_grad():
+            obs_norm = self.normalize_obs(obs, update=True)
+            action, log_prob = self.actor.get_action_and_log_prob(obs_norm)
+            value = self.critic(obs_norm)
         return action, log_prob, value
     
     def get_value(self, obs: torch.Tensor):
@@ -1573,7 +1555,8 @@ class L2FPPOAgent:
             return self.critic(obs_norm)
     
     def update(self, obs: torch.Tensor, actions: torch.Tensor,
-               log_probs: torch.Tensor, returns: torch.Tensor, advantages: torch.Tensor):
+               log_probs: torch.Tensor, returns: torch.Tensor, advantages: torch.Tensor,
+               minibatch_size: int = 4096):
         obs = obs.detach()
         actions = actions.detach()
         log_probs = log_probs.detach()
@@ -1585,32 +1568,48 @@ class L2FPPOAgent:
         obs_norm = self.normalize_obs(obs, update=False)
         
         total_loss = 0.0
-        for _ in range(self.epochs):
-            mean = self.actor(obs_norm)
-            std = torch.exp(self.actor.log_std)
-            dist = torch.distributions.Normal(mean, std)
-            
-            new_log_probs = dist.log_prob(actions).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1).mean()
-            
-            ratio = (new_log_probs - log_probs).exp()
-            clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-            policy_loss = -torch.min(ratio * advantages, clip_adv).mean()
-            
-            values = self.critic(obs_norm)
-            value_loss = ((values - returns) ** 2).mean()
-            
-            loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            
-            total_loss += loss.item()
+        num_samples = obs.shape[0]
+        num_updates = 0
         
-        return total_loss / self.epochs
+        for _ in range(self.epochs):
+            indices = torch.randperm(num_samples, device=obs.device)
+            
+            for start in range(0, num_samples, minibatch_size):
+                end = min(start + minibatch_size, num_samples)
+                mb_idx = indices[start:end]
+                
+                mb_obs = obs_norm[mb_idx]
+                mb_actions = actions[mb_idx]
+                mb_log_probs = log_probs[mb_idx]
+                mb_returns = returns[mb_idx]
+                mb_advantages = advantages[mb_idx]
+                
+                mean = self.actor(mb_obs)
+                std = torch.exp(self.actor.log_std)
+                dist = torch.distributions.Normal(mean, std)
+                
+                new_log_probs = dist.log_prob(mb_actions).sum(dim=-1)
+                entropy = dist.entropy().sum(dim=-1).mean()
+                
+                ratio = (new_log_probs - mb_log_probs).exp()
+                clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * mb_advantages
+                policy_loss = -torch.min(ratio * mb_advantages, clip_adv).mean()
+                
+                values = self.critic(mb_obs)
+                value_loss = ((values - mb_returns) ** 2).mean()
+                
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                num_updates += 1
+        
+        return total_loss / max(num_updates, 1)
     
     def save(self, path: str, iteration: int, best_reward: float):
         torch.save({
@@ -1645,17 +1644,23 @@ class L2FPPOAgent:
 
 def compute_gae(rewards, values, dones, next_value, gamma=0.99, gae_lambda=0.95):
     """Compute Generalized Advantage Estimation."""
+    T = len(rewards)
     advantages = torch.zeros_like(rewards)
-    last_gae = 0
     
-    for t in reversed(range(len(rewards))):
-        if t == len(rewards) - 1:
-            next_val = next_value
-        else:
-            next_val = values[t + 1]
-        
-        delta = rewards[t] + gamma * next_val * (1 - dones[t].float()) - values[t]
-        advantages[t] = last_gae = delta + gamma * gae_lambda * (1 - dones[t].float()) * last_gae
+    # Pre-compute masks for all timesteps
+    not_dones = 1.0 - dones.float()
+    
+    # Shift values to get next_values: values[1:] + [next_value]
+    next_values = torch.cat([values[1:], next_value.unsqueeze(0)], dim=0)
+    
+    # Compute all TD residuals at once
+    deltas = rewards + gamma * next_values * not_dones - values
+    
+    # Sequential scan for GAE (unavoidable due to recurrence)
+    last_gae = torch.zeros_like(rewards[0])
+    for t in reversed(range(T)):
+        last_gae = deltas[t] + gamma * gae_lambda * not_dones[t] * last_gae
+        advantages[t] = last_gae
     
     returns = advantages + values
     return returns, advantages
