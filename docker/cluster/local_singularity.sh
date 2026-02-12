@@ -16,6 +16,8 @@ setup_directories() {
         "${CLUSTER_ISAAC_SIM_CACHE_DIR}/cache/computecache" \
         "${CLUSTER_ISAAC_SIM_CACHE_DIR}/logs" \
         "${CLUSTER_ISAAC_SIM_CACHE_DIR}/data" \
+	"${CLUSTER_ISAAC_SIM_CACHE_DIR}/kit/data" \
+	"${CLUSTER_ISAAC_SIM_CACHE_DIR}/kit/data" \
         "${CLUSTER_ISAAC_SIM_CACHE_DIR}/documents"; do
         if [ ! -d "$dir" ]; then
             mkdir -p "$dir"
@@ -34,27 +36,29 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 source $SCRIPT_DIR/.env.cluster
 source $SCRIPT_DIR/../.env.base
 
+# Parse arguments
+ISAACLAB_SOURCE_DIR="$1"
+CONTAINER_PROFILE="$2"
+TRAIN_SCRIPT="$3"
+shift 3  # Remove first 3 args
+SCRIPT_ARGS=("$@")  # All remaining args
+
 # Use CLUSTER_ISAACLAB_DIR if first argument is not provided or doesn't exist
-if [ -z "$1" ] || [ ! -d "$1" ]; then
+if [ -z "$ISAACLAB_SOURCE_DIR" ] || [ ! -d "$ISAACLAB_SOURCE_DIR" ]; then
     ISAACLAB_SOURCE_DIR=$CLUSTER_ISAACLAB_DIR
     echo "[INFO] Using CLUSTER_ISAACLAB_DIR: $ISAACLAB_SOURCE_DIR"
 else
-    ISAACLAB_SOURCE_DIR=$1
     echo "[INFO] Using provided directory: $ISAACLAB_SOURCE_DIR"
 fi
 
-# Verify the directory exists
-if [ ! -d "$ISAACLAB_SOURCE_DIR" ]; then
-    echo "[ERROR] Isaac Lab directory does not exist: $ISAACLAB_SOURCE_DIR"
+# Validate arguments
+if [ -z "$CONTAINER_PROFILE" ] || [ -z "$TRAIN_SCRIPT" ]; then
+    echo "[ERROR] Usage: $0 <isaaclab_dir> <container_profile> <training_script> [args...]"
+    echo "Example: $0 /scratch/user/isaaclab isaac-lab-base source/path/to/train.py --headless"
     exit 1
 fi
 
-# Shift arguments: container profile is now $1, script is $2, etc.
-shift
-CONTAINER_PROFILE=$1
-shift
-
-echo "(run_singularity.py): Called on compute node from current isaaclab directory $ISAACLAB_SOURCE_DIR with container profile $CONTAINER_PROFILE and arguments ${@}"
+echo "(run_singularity.py): Called on compute node from current isaaclab directory $ISAACLAB_SOURCE_DIR with container profile $CONTAINER_PROFILE and arguments $TRAIN_SCRIPT ${SCRIPT_ARGS[*]}"
 
 # Set TMPDIR to scratch space
 if [ -z "$TMPDIR" ]; then
@@ -91,26 +95,26 @@ touch "$ISAACLAB_SOURCE_DIR/logs/.keep"
 
 # Copy isaaclab to compute node
 echo "[DEBUG] Copying $ISAACLAB_SOURCE_DIR to $TMPDIR"
-cp -r $ISAACLAB_SOURCE_DIR $TMPDIR
+cp -r "$ISAACLAB_SOURCE_DIR" $TMPDIR
 dir_name=$(basename "$ISAACLAB_SOURCE_DIR")
 echo "[DEBUG] Directory name: $dir_name"
 echo "[DEBUG] Target path in TMPDIR: $TMPDIR/$dir_name"
 
 # Verify the training script exists
-TRAIN_SCRIPT="$1"
 if [ -f "$TMPDIR/$dir_name/$TRAIN_SCRIPT" ]; then
     echo "[INFO] Training script found: $TRAIN_SCRIPT"
 else
     echo "[ERROR] Training script NOT found at: $TMPDIR/$dir_name/$TRAIN_SCRIPT"
     echo "[DEBUG] Contents of $TMPDIR/$dir_name:"
     ls -la $TMPDIR/$dir_name/ | head -20
+    exit 1
 fi
 
 # Extract container
-echo "[DEBUG] Extracting container from $CLUSTER_SIF_PATH/$CONTAINER_PROFILE.tar"
-tar -xf $CLUSTER_SIF_PATH/$CONTAINER_PROFILE.tar -C $TMPDIR
+echo "[DEBUG] Extracting container from $CLUSTER_SIF_PATH/${CONTAINER_PROFILE}.tar"
+tar -xf "$CLUSTER_SIF_PATH/${CONTAINER_PROFILE}.tar" -C $TMPDIR
 
-# Create Isaac Sim symlink in the copied directory (REQUIRED by isaaclab.sh)
+# Create Isaac Sim symlink (REQUIRED by isaaclab.sh)
 if [ ! -L "$TMPDIR/$dir_name/_isaac_sim" ]; then
     echo "[INFO] Creating _isaac_sim symlink -> $DOCKER_ISAACSIM_ROOT_PATH"
     ln -sf $DOCKER_ISAACSIM_ROOT_PATH $TMPDIR/$dir_name/_isaac_sim
@@ -124,7 +128,7 @@ else
     exit 1
 fi
 
-# Execute with isaaclab.sh install
+# Execute with proper argument handling
 echo "[DEBUG] Running singularity with bind: $TMPDIR/$dir_name:/workspace/isaaclab:rw"
 $SINGULARITY_BIN exec \
     -B $TMPDIR/docker-isaac-sim/cache/kit:${DOCKER_ISAACSIM_ROOT_PATH}/kit/cache:rw \
@@ -132,36 +136,31 @@ $SINGULARITY_BIN exec \
     -B $TMPDIR/docker-isaac-sim/cache/pip:${DOCKER_USER_HOME}/.cache/pip:rw \
     -B $TMPDIR/docker-isaac-sim/cache/glcache:${DOCKER_USER_HOME}/.cache/nvidia/GLCache:rw \
     -B $TMPDIR/docker-isaac-sim/cache/computecache:${DOCKER_USER_HOME}/.nv/ComputeCache:rw \
+    -B $TMPDIR/docker-isaac-sim/kit/data:${DOCKER_ISAACSIM_ROOT_PATH}/kit/data:rw \
     -B $TMPDIR/docker-isaac-sim/logs:${DOCKER_USER_HOME}/.nvidia-omniverse/logs:rw \
     -B $TMPDIR/docker-isaac-sim/data:${DOCKER_USER_HOME}/.local/share/ov/data:rw \
     -B $TMPDIR/docker-isaac-sim/documents:${DOCKER_USER_HOME}/Documents:rw \
+    -B $TMPDIR/docker-isaac-sim/kit/data:${DOCKER_ISAACSIM_ROOT_PATH}/kit/data:rw \
     -B $TMPDIR/$dir_name:/workspace/isaaclab:rw \
-    -B $CLUSTER_ISAACLAB_DIR/logs:/workspace/isaaclab/logs:rw \
+    -B $ISAACLAB_SOURCE_DIR/logs:/workspace/isaaclab/logs:rw \
     --env ISAACLAB_PATH=/workspace/isaaclab \
     --pwd /workspace/isaaclab \
     --nv \
-    $TMPDIR/$CONTAINER_PROFILE.sif \
-    /bin/bash -c "
-        cd /workspace/isaaclab && \
-        echo 'Installing Isaac Lab...' && \
-        ./isaaclab.sh --install && \
-        echo 'Isaac Lab installed, running training...' && \
-        ./isaaclab.sh -p ${@}
-    "
-
+    "$TMPDIR/${CONTAINER_PROFILE}.sif" \
+    ./isaaclab.sh -p "$TRAIN_SCRIPT" "${SCRIPT_ARGS[@]}"
 
 # Copy cache back
 rsync -azPv $TMPDIR/docker-isaac-sim $CLUSTER_ISAAC_SIM_CACHE_DIR/..
 
-# Cleanup temporary directory if in interactive mode
+# Cleanup temporary directory if in interactive mode (not PBS job)
 if [ -z "$PBS_JOBID" ]; then
     echo "[INFO] Cleaning up TMPDIR: $TMPDIR"
     rm -rf $TMPDIR
 fi
 
 # Cleanup code copy if configured
-if $REMOVE_CODE_COPY_AFTER_JOB; then
-    rm -rf $ISAACLAB_SOURCE_DIR
+if [ "$REMOVE_CODE_COPY_AFTER_JOB" = "true" ]; then
+    rm -rf "$ISAACLAB_SOURCE_DIR"
 fi
 
 echo "(run_singularity.py): Return"
