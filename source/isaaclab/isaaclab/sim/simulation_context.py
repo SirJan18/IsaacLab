@@ -20,7 +20,6 @@ from datetime import datetime
 from typing import Any
 
 import carb
-import flatdict
 import isaacsim.core.utils.stage as stage_utils
 import omni.log
 import omni.physx
@@ -32,6 +31,7 @@ from isaacsim.core.version import get_version
 from pxr import Gf, PhysxSchema, Usd, UsdPhysics
 
 from isaaclab.sim.utils import create_new_stage_in_memory, use_stage
+from isaaclab.utils import dict as dict_utils
 
 from .simulation_cfg import SimulationCfg
 from .spawners import DomeLightCfg, GroundPlaneCfg
@@ -359,7 +359,7 @@ class SimulationContext(_SimulationContext):
             preset_filename = os.path.join(isaaclab_app_exp_path, f"rendering_modes/{rendering_mode}.kit")
             with open(preset_filename) as file:
                 preset_dict = toml.load(file)
-            preset_dict = dict(flatdict.FlatDict(preset_dict, delimiter="."))
+            preset_dict = dict_utils.flatten_dict(preset_dict, delimiter=".")
 
             # set presets
             for key, value in preset_dict.items():
