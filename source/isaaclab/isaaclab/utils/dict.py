@@ -267,6 +267,33 @@ def convert_dict_to_backend(
     return output_dict
 
 
+def flatten_dict(data: Mapping[str, Any], delimiter: str = ".") -> dict[str, Any]:
+    """Flatten a nested dictionary into a single-level dictionary.
+
+    Nested keys are joined with the provided delimiter.
+
+    Args:
+        data: Nested dictionary to flatten.
+        delimiter: Separator used when joining nested keys.
+
+    Returns:
+        A flattened dictionary.
+    """
+
+    flat_data: dict[str, Any] = {}
+
+    def _flatten(value: Any, parent_key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for key, nested_value in value.items():
+                full_key = f"{parent_key}{delimiter}{key}" if parent_key else str(key)
+                _flatten(nested_value, full_key)
+        else:
+            flat_data[parent_key] = value
+
+    _flatten(data)
+    return flat_data
+
+
 def update_dict(orig_dict: dict, new_dict: collections.abc.Mapping) -> dict:
     """Updates existing dictionary with values from a new dictionary.
 
