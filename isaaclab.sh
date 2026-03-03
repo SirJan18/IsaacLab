@@ -553,7 +553,19 @@ while [[ $# -gt 0 ]]; do
             fi
             # install the learning frameworks specified
             ${pip_command} -e "${ISAACLAB_PATH}/source/isaaclab_rl[${framework_name}]"
-            ${pip_command} -e "${ISAACLAB_PATH}/source/isaaclab_mimic[${framework_name}]"
+            if ! ${pip_command} -e "${ISAACLAB_PATH}/source/isaaclab_mimic[${framework_name}]"; then
+                echo "[WARN] Failed to install isaaclab_mimic extras for framework '${framework_name}'."
+                echo "[WARN] Retrying isaaclab_mimic core package without extras..."
+                if ! ${pip_command} -e "${ISAACLAB_PATH}/source/isaaclab_mimic"; then
+                    if is_docker; then
+                        echo "[WARN] isaaclab_mimic installation failed in Docker context; continuing build."
+                        echo "[WARN] You can retry later with: isaaclab.sh --install ${framework_name}"
+                    else
+                        echo "[ERROR] isaaclab_mimic installation failed."
+                        exit 1
+                    fi
+                fi
+            fi
 
             # in some rare cases, torch might not be installed properly by setup.py, add one more check here
             # can prevent that from happening
